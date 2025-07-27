@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from ebooklib import epub
 from loguru import logger
 from pydub import AudioSegment, silence
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append("third_party/Matcha-TTS")
 try:
@@ -417,51 +418,104 @@ class AudiobookConverter:
         return chapter_srt_path
 
     @staticmethod
-    def merge_chapter_audio_with_subtitles():
+    def create_individual_mp4s():
         audio_sub_folders = sorted(glob.glob(str(AUDIO_DIR / "*/")))
-        AudiobookConverter.merge_chapter_audio("wav")
 
         for chapter_folder in audio_sub_folders:
             chapter_folder = Path(chapter_folder)
-            chapter_name = chapter_folder.stem
 
-            chapter_mp4_path = AUDIO_DIR / f"{chapter_name}.mp4"
-            chapter_audio_path = AUDIO_DIR / f"{chapter_name}.wav"
+            # 获取所有WAV和TXT文件
+            wav_files = sorted(chapter_folder.glob("*.wav"))
+            txt_files = sorted(chapter_folder.glob("*.txt"))
 
-            chapter_srt_path = AudiobookConverter.generate_srt(chapter_folder)
+            ffmpeg_commands = []
+            for i, (wav_file, txt_file) in enumerate(zip(wav_files, txt_files)):
+                with open(txt_file, "r", encoding="utf-8") as f:
+                    subtitle_text = f.read().strip()
 
-            ffmpeg_video_command = [
+                audio_duration = len(AudioSegment.from_wav(wav_file)) / 1000.0
+
+                temp_srt_path = chapter_folder / f"temp_{i:03d}.srt"
+                with open(temp_srt_path, "w", encoding="utf-8") as srt_file:
+                    hours = int(audio_duration // 3600)
+                    minutes = int((audio_duration % 3600) // 60)
+                    seconds = int(audio_duration % 60)
+                    end_time = f"{hours:02d}:{minutes:02d}:{seconds:02d},000"
+
+                    srt_file.write("1\n")
+                    srt_file.write(f"00:00:00,000 --> {end_time}\n")
+                    srt_file.write(f"{subtitle_text}\n\n")
+
+                # 输出MP4路径
+                output_mp4_path = chapter_folder / f"{Path(wav_file).stem}.mp4"
+
+                # 使用ffmpeg创建带字幕的MP4
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-i",
+                    str(wav_file),
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=1920x1080:r=1",
+                    "-vf",
+                    f"subtitles={temp_srt_path}:force_style='Fontsize=24,Alignment=10,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=0,Fontsize=32'",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-crf",
+                    "18",
+                    "-shortest",
+                    "-y",
+                    str(output_mp4_path),
+                ]
+                ffmpeg_commands.append(ffmpeg_command)
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                executor.map(AudiobookConverter._run_ffmpeg_command, ffmpeg_commands)
+
+            str_files = AUDIO_DIR.glob("**/*.srt")
+            for file in str_files:
+                file.unlink()
+
+    @staticmethod
+    def merge_chapter_mp4s():
+        audio_sub_folders = sorted(glob.glob(str(AUDIO_DIR / "*/")))
+        for chapter_folder in audio_sub_folders:
+            chapter_folder = Path(chapter_folder)
+
+            mp4_files = sorted(chapter_folder.glob("*.mp4"))
+            chapter_output = AUDIO_DIR / f"{chapter_folder.stem}.mp4"
+
+            # 为每个章节创建合并文件列表
+            merge_list_path = chapter_folder / f"merge_list.txt"
+
+            with open(merge_list_path, "w", encoding="utf-8") as f:
+                for mp4_file in sorted(mp4_files):
+                    f.write(f"file '{mp4_file.absolute()}'\n")
+
+            ffmpeg_command = [
                 "ffmpeg",
-                "-i",
-                str(chapter_audio_path),  # 音频输入
                 "-f",
-                "lavfi",
+                "concat",
+                "-safe",
+                "0",
                 "-i",
-                "color=c=black:s=1920x1080:r=1",  # 黑色视频背景
-                "-vf",
-                f"subtitles={chapter_srt_path}:force_style='Fontsize=24,PrimaryColour=&HFFFFFF'",  # 字幕
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",  # 音频编码
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-crf",
-                "18",  # 视频编码
-                "-shortest",  # 匹配短的流长度
+                str(merge_list_path),
+                "-c",
+                "copy",
                 "-y",
-                str(chapter_mp4_path),
+                str(chapter_output),
             ]
 
-            try:
-                AudiobookConverter._run_ffmpeg_command(
-                    ffmpeg_video_command, f"生成带字幕视频: {chapter_name}.mp4"
-                )
-            except subprocess.CalledProcessError:
-                logger.error(f"跳过章节: {chapter_name} 由于ffmpeg视频生成失败")
-                continue
+            AudiobookConverter._run_ffmpeg_command(ffmpeg_command)
+            mp4_files = chapter_folder.glob("*.mp4")
+            for mp4_file in mp4_files:
+                mp4_file.unlink()
 
 
 if __name__ == "__main__":
@@ -472,6 +526,6 @@ if __name__ == "__main__":
     # 制作电子书
     # converter.epub2txt()
     # converter.txt2audio()
-    # converter.merge_chapter_audio()
-    # 为每个章节合并音频并添加字幕
-    converter.merge_chapter_audio_with_subtitles()
+
+    # chapter_mp4_dict = converter.create_individual_mp4s()
+    chapter_results = converter.merge_chapter_mp4s()
