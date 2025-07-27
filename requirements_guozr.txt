@@ -39,4 +39,4 @@ wget
 loguru
 ebooklib
 pydub
-vllm==0.9.2
+vllm>0.9.2
