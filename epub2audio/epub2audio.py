@@ -38,11 +38,15 @@ TXT_DIR = BASE_DIR / "epub_res"
 AUDIO_DIR = BASE_DIR / "generated_audio"
 ZERO_SHOT_PROMPT_DIR = BASE_DIR / "zero_shot_prompts"
 
+
 MP4_PATH = BASE_DIR / "ladynana.mp4"
 RAW_WAV_PATH = BASE_DIR / "laydnana.wav"
-PROMPT_WAV_PATH = ZERO_SHOT_PROMPT_DIR / "laydnana_segment_000.wav"
 
+PROMPT_WAV_PATH = ZERO_SHOT_PROMPT_DIR / "laydnana_segment_000.wav"
 PROMPT_TEXT = "中国的兄弟姐妹们你们好，我是俄罗斯娜娜。昨天晚上我的评论区炸锅了。"
+
+# PROMPT_WAV_PATH = Path("/home/guozr/CODE/CosyVoice/asset/zero_shot_prompt.wav")
+# PROMPT_TEXT = "希望你以后能够做的比我还好呦。"
 
 
 FFMPEG_AUDIO_SAMPLE_RATE = 16000  # 音频采样率 (Audio sample rate)
@@ -248,18 +252,12 @@ class AudiobookConverter:
                 load_vllm=True,
                 fp16=True,
             )
-            logger.info("CosyVoice2 模型初始化成功")
+        logger.success("CosyVoice2 模型初始化成功")
 
-            try:
-                self.prompt_speech_16k = load_wav(
-                    str(PROMPT_WAV_PATH), FFMPEG_AUDIO_SAMPLE_RATE
-                )
-                logger.info("提示语音加载成功")
-            except Exception as e:
-                logger.error(
-                    f"从 '{PROMPT_WAV_PATH}' 加载提示语音失败，请确保文件存在且为有效 WAV 格式。错误：{e}"
-                )
-                raise  # 重新抛出异常以停止执行
+        self.prompt_speech_16k = load_wav(
+            str(PROMPT_WAV_PATH), FFMPEG_AUDIO_SAMPLE_RATE
+        )
+        logger.success("提示语音加载成功")
 
     def txt2audio(self):
         self._initialize_cosyvoice()
@@ -267,12 +265,14 @@ class AudiobookConverter:
         search_pattern = str(TXT_DIR / "*.txt")
         txt_files = sorted(glob.glob(search_pattern))
 
-        for file_path_str in txt_files:
-            file_path = Path(file_path_str)
+        for file_path in txt_files:
+            file_path = Path(file_path)
             filename_stem = file_path.stem
             output_wav_subdir = AUDIO_DIR / filename_stem
 
-            output_wav_subdir.mkdir(parents=True, exist_ok=False)
+            output_wav_subdir.mkdir(parents=True, exist_ok=True)
+            for file in Path(output_wav_subdir).glob("*.wav"):
+                file.unlink()
 
             with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -291,7 +291,7 @@ class AudiobookConverter:
                 torchaudio.save(
                     str(output_wav_path),
                     audio["tts_speech"].cpu(),  # 如果在 GPU 上，将张量移到 CPU 再保存
-                    FFMPEG_AUDIO_SAMPLE_RATE,
+                    self.cosyvoice.sample_rate,
                 )
 
     def merge_chapter_audio(self):
@@ -331,6 +331,6 @@ if __name__ == "__main__":
     # converter.mp42wav()
     # converter.segment_wav()
     # 制作电子书
-    converter.epub2txt()
-    # converter.txt2audio()
+    # converter.epub2txt()
+    converter.txt2audio()
     # converter.merge_chapter_audio()
