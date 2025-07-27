@@ -74,6 +74,26 @@ class AudiobookConverter:
         self.prompt_speech_16k = None  # Prompt speech for CosyVoice2
 
     @staticmethod
+    def _run_ffmpeg_command(command_list, description=""):
+        """运行ffmpeg命令并打印详细错误信息"""
+        logger.info(" ".join(command_list))
+        try:
+            result = subprocess.run(
+                command_list, check=True, capture_output=True, text=True
+            )
+            if description:
+                logger.success(f"成功: {description}")
+            return result
+        except subprocess.CalledProcessError as e:
+            logger.error(f"ffmpeg命令失败: {description}")
+            logger.error(f"返回码: {e.returncode}")
+            if e.stdout.strip():
+                logger.error(f"标准输出: {e.stdout}")
+            if e.stderr.strip():
+                logger.error(f"标准错误: {e.stderr}")
+            raise
+
+    @staticmethod
     def mp42wav():
         if not MP4_PATH.exists():
             logger.error(f"MP4 文件未找到: {MP4_PATH}")
@@ -93,10 +113,9 @@ class AudiobookConverter:
             "-y",  # 如果输出文件存在则覆盖 (Overwrite output file if it exists)
             str(RAW_WAV_PATH),
         ]
-        logger.info(" ".join(ffmpeg_convert_command))
 
-        subprocess.run(
-            ffmpeg_convert_command, check=True, capture_output=True, text=True
+        AudiobookConverter._run_ffmpeg_command(
+            ffmpeg_convert_command, f"{MP4_PATH} -> {RAW_WAV_PATH}"
         )
 
     @staticmethod
@@ -273,6 +292,8 @@ class AudiobookConverter:
             output_wav_subdir.mkdir(parents=True, exist_ok=True)
             for file in Path(output_wav_subdir).glob("*.wav"):
                 file.unlink()
+            for file in Path(output_wav_subdir).glob("*.txt"):
+                file.unlink()
 
             with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -288,41 +309,159 @@ class AudiobookConverter:
                 )
             ):
                 output_wav_path = output_wav_subdir / f"{step:03d}.wav"
+                output_txt_path = output_wav_subdir / f"{step:03d}.txt"
+
+                with open(output_txt_path, "w") as f:
+                    f.write(audio["text"])
+
                 torchaudio.save(
                     str(output_wav_path),
                     audio["tts_speech"].cpu(),  # 如果在 GPU 上，将张量移到 CPU 再保存
                     self.cosyvoice.sample_rate,
                 )
 
-    def merge_chapter_audio(self):
+    @staticmethod
+    def merge_chapter_audio(ext="mp3"):
         audio_sub_folders = sorted(glob.glob(str(AUDIO_DIR / "*/")))
         for chapter_folder in audio_sub_folders:
             chapter_folder = Path(chapter_folder)
 
             list_file_path = chapter_folder / "filelist.txt"
-            output_mp3_path = AUDIO_DIR / "{chapter_folder.stem}.mp3"
+            output_mp3_path = AUDIO_DIR / f"{chapter_folder.stem}.{ext}"
+            wav_files = sorted(glob.glob(str(chapter_folder / "*.wav")))
             with open(list_file_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(sorted(glob.glob(str(chapter_folder / "*.wav")))))
+                f.write("\n".join([f"file {wav_file}" for wav_file in wav_files]))
 
-            ffmpeg_command = [
+            if ext == "mp3":
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file_path),
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    "-y",
+                    str(output_mp3_path),
+                ]
+            elif ext == "wav":
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file_path),
+                    "-c",
+                    "copy",
+                    "-y",
+                    str(output_mp3_path),
+                ]
+            else:
+                raise ValueError("invalid ext")
+
+            try:
+                AudiobookConverter._run_ffmpeg_command(
+                    ffmpeg_command, f"合并章节音频: {chapter_folder.stem}.{ext}"
+                )
+                os.remove(list_file_path)
+            except subprocess.CalledProcessError:
+                # 清理临时文件并继续处理下一个文件
+                if list_file_path.exists():
+                    os.remove(list_file_path)
+                logger.error(f"跳过章节: {chapter_folder.stem} 由于ffmpeg命令失败")
+                continue
+
+    @staticmethod
+    def generate_srt(chapter_folder: Path):
+        def _seconds_to_srt_time(seconds):
+            """将秒数转换为SRT格式的时间戳"""
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            milliseconds = int((seconds - int(seconds)) * 1000)
+            return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+        txt_files = sorted(chapter_folder.glob(("*.txt")))
+        wav_files = sorted(chapter_folder.glob("*.wav"))
+        chapter_srt_path = chapter_folder / f"{chapter_folder.stem}.srt"
+
+        with open(chapter_srt_path, "w", encoding="utf-8") as srt_file:
+            current_time = 0.0
+            for i, (wav_file, txt_file) in enumerate(zip(wav_files, txt_files)):
+                with open(txt_file, "r", encoding="utf-8") as txt_f:
+                    text = txt_f.read().strip()
+
+                if not text:
+                    continue
+                duration = len(AudioSegment.from_wav(wav_file)) / 1000.0
+
+                start_time = current_time
+                end_time = current_time + duration
+
+                start_str = _seconds_to_srt_time(start_time)
+                end_str = _seconds_to_srt_time(end_time)
+
+                # 写入字幕条目
+                srt_file.write(f"{i + 1}\n")
+                srt_file.write(f"{start_str} --> {end_str}\n")
+                srt_file.write(f"{text}\n\n")
+
+                current_time = end_time
+
+        return chapter_srt_path
+
+    @staticmethod
+    def merge_chapter_audio_with_subtitles():
+        audio_sub_folders = sorted(glob.glob(str(AUDIO_DIR / "*/")))
+        AudiobookConverter.merge_chapter_audio("wav")
+
+        for chapter_folder in audio_sub_folders:
+            chapter_folder = Path(chapter_folder)
+            chapter_name = chapter_folder.stem
+
+            chapter_mp4_path = AUDIO_DIR / f"{chapter_name}.mp4"
+            chapter_audio_path = AUDIO_DIR / f"{chapter_name}.wav"
+
+            chapter_srt_path = AudiobookConverter.generate_srt(chapter_folder)
+
+            ffmpeg_video_command = [
                 "ffmpeg",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
                 "-i",
-                str(list_file_path),
+                str(chapter_audio_path),  # 音频输入
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=1920x1080:r=1",  # 黑色视频背景
+                "-vf",
+                f"subtitles={chapter_srt_path}:force_style='Fontsize=24,PrimaryColour=&HFFFFFF'",  # 字幕
                 "-c:a",
-                "libmp3lame",
+                "aac",
                 "-b:a",
-                "192k",
+                "192k",  # 音频编码
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",  # 视频编码
+                "-shortest",  # 匹配短的流长度
                 "-y",
-                str(output_mp3_path),
+                str(chapter_mp4_path),
             ]
 
-            logger.info(" ".join(ffmpeg_command))
-            subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-            os.remove(list_file_path)
+            try:
+                AudiobookConverter._run_ffmpeg_command(
+                    ffmpeg_video_command, f"生成带字幕视频: {chapter_name}.mp4"
+                )
+            except subprocess.CalledProcessError:
+                logger.error(f"跳过章节: {chapter_name} 由于ffmpeg视频生成失败")
+                continue
 
 
 if __name__ == "__main__":
@@ -332,5 +471,7 @@ if __name__ == "__main__":
     # converter.segment_wav()
     # 制作电子书
     # converter.epub2txt()
-    converter.txt2audio()
+    # converter.txt2audio()
     # converter.merge_chapter_audio()
+    # 为每个章节合并音频并添加字幕
+    converter.merge_chapter_audio_with_subtitles()
